@@ -1,11 +1,5 @@
 #!/usr/bin/perl
 
-# $Id$
-# $Revision$
-# $Source$
-# $HeadURL$
-# $Date$
-
 ## Script to generate SoundExchange logs for submission to NPR
 # Author: Kit Peters <cpeters@ucmo.edu>
 # Date: 10 January 2013
@@ -34,8 +28,12 @@ use IPC::Open3 qw/open3/;
 use Sys::Hostname qw/hostname/;
 use Cwd qw/getcwd abs_path/;
 use Net::SMTP;
+use Email::MIME::Creator;
+use IO::All;
+use Archive::Zip qw/AZ_OK/;
+use File::Temp qw/tempfile/;
 
-our $VERSION = q/2.0/;
+our $VERSION = q/2.1/;
 
 # Global variables section - do not modify these
 Readonly my $YEAR         => localtime->year;
@@ -108,10 +106,12 @@ Readonly my %CONFIG => (
     q/notify_from/                  => q|noreply@ktbg.int|,
 
 # "To" address for notification emails
-    q/notify_to/                    => q|cpeters@ucmo.edu|,
+    q/notify_to/                    => q|bjohnson@ktbg.fm|,
 
 # DSN of database to connect to
     q/dsn/                          => q{ktbg_local},
+    q/compilations_data_file/       => q{compilations.csv},
+    q/use_csv/                      => 1,
 );
 
 main();
@@ -135,9 +135,8 @@ sub main {
     my $output_dir_absolute = abs_path( $CONFIG{'output_dir'} );
     my $message             = qq/SoundExchange logs for $LAST_QUARTER $YEAR are available on "$hostname" in $output_dir_absolute/;
     eval {
-        _mail( { 'from' => $CONFIG{'notify_from'}, 'to' => $CONFIG{'notify_to'}, 'subject' => qq/$CALL_LETTERS $LAST_QUARTER $YEAR SoundExchange logs are ready/ } );
-        1;
-    } or carp(qq/Failed to send email: $EVAL_ERROR/);
+        email_logs($output_dir_absolute);
+    } or croak(qq/Failed to email logs: $EVAL_ERROR/);
 
     return 1;
 }
@@ -185,48 +184,85 @@ sub _print_playlist_log {
     my $fh        = shift;
     my $log_dates = shift;
 
-    my $connect_string = qq/DBI:ODBC:$CONFIG{'dsn'}/;
-    my $dbh = DBI->connect( $connect_string, $EMPTY, $EMPTY, { q/PrintError/, => 1, q/RaiseError/ => 1 } );
-#    my $sth = $dbh->prepare(q/SELECT Song_Name, Artist_Name, Album_Name, Year, Record_Company FROM compilations WHERE Song_ID = ? /);
     my $csv = Text::CSV_XS->new( { q/sep_char/ => $CONFIG{'output_delimiter'}, eol => $CONFIG{'output_record_separator'} } );
 
     $csv->print( $fh, \@{ $CONFIG{'playlist_output_field_names'} } );
     for my $log_date ( @{$log_dates} ) {
         my $full_date = Time::Piece->strptime( $log_date, q/%y%m%d/ )->strftime(q|%m/%d/%Y|);
         my $playlist = File::Spec->catfile( $CONFIG{'playlist_logs_dir'}, qq/$log_date.lst/ );
+        
         my @songs;
-        eval {
-            @songs = _parse_playlist($playlist);
-            for my $song (@songs) {    # hey, it's a song of songs!
-                # FIXME: Does mdbtools not support prepared statements?
-                my $sth = eval {
-                    $dbh->prepare(qq/SELECT Song_Name, Artist_Name, Album_Name, Year, Record_Company FROM compilations WHERE Song_ID = '$song->{'cut_id'}' /);
-                };
-                if ($EVAL_ERROR) {
-                    croak(qq/Failed to prepare song select statement: $EVAL_ERROR/);
-                }
-                _build_song_record( $sth, $song );
-                $csv->print( $fh, [ qq/$full_date $song->{'actual'}/, $song->{'duration'}, $song->{'Artist_Name'}, $song->{'Song_Name'}, $song->{'Album_Name'}, $song->{'Record_Company'} ] );
-            }
-            1;
-        } or croak(qq/Failed to parse playlist $playlist: $EVAL_ERROR/);
+        if ($CONFIG{'use_csv'}) {
+            @songs = _get_song_records_csv($playlist);
+        }
+        else {
+            @songs = _get_song_records_db($playlist);
+        }
+        for my $song (@songs) {
+            $csv->print( $fh, [ qq/$full_date $song->{'actual'}/, $song->{'duration'}, $song->{'Artist_Name'}, $song->{'Song_Name'}, $song->{'Album_Name'}, $song->{'Record_Company'} ] );
+        }
     }
     return 1;
 }
 
-# helper function for _print_playlist_log
-sub _build_song_record {
-    my $sth  = shift;
-    my $song = shift;
+sub _get_song_records_csv {
+    my $playlist = shift;
+    my $compilations_data = _get_compilations_data();
+    my @songs;
     eval {
-        #$sth->execute( $song->{'cut_id'} );
-        $sth->execute;
+        @songs = _parse_playlist($playlist);
+        for my $song (@songs) {    # hey, it's a song of songs!
+            _build_song_record_csv( $compilations_data, $song );
+        }
         1;
-    } or croak(qq/Failed to execute song select statement: $EVAL_ERROR/);
-   
+    } or croak(qq/Failed to parse playlist $playlist: $EVAL_ERROR/);
+    return @songs;
+}
+
+sub _get_song_records_db {
+    my $playlist = shift;
+    my @songs;
+    
+    my $connect_string = qq/DBI:ODBC:$CONFIG{'dsn'}/;
+    my $dbh = DBI->connect( $connect_string, $EMPTY, $EMPTY, { q/PrintError/, => 1, q/RaiseError/ => 1, 'odbc_batch_size' => 1 } );
+    eval {
+        @songs = _parse_playlist($playlist);
+        for my $song (@songs) {    # hey, it's a song of songs!
+            _build_song_record_db( $dbh, $song );
+        }
+        1;
+    } or croak(qq/Failed to parse playlist $playlist: $EVAL_ERROR/);
+    return @songs;
+}
+
+# helper function for _print_playlist_log
+sub _build_song_record_csv {
+    my $compilations_data = shift;
+    my $song = shift;
+    my $song_record = $compilations_data->{$song->{'cut_id'}};
+
+    @{$song}{keys %{$song_record}} = values %{$song_record};
+        
+    $song->{'duration'} = _get_duration( $song->{'file_name'} );
+    for my $field (qw/Artist_Name Song_Name Album_Name Record_Company/) {
+        $song->{$field} ||= 'N/A';                               # fill in blanks with "N/A"
+    }
+    return 1;
+}
+
+sub _build_song_record_db {
+    my ($dbh, $song) = @_;
+    my $sth = eval {
+        $dbh->prepare(qq/SELECT Song_Name, Artist_Name, Album_Name, Year, Record_Company FROM compilations WHERE Song_ID = 'xxx$song->{'cut_id'}' /);
+    };
+    if ($EVAL_ERROR) {
+        croak(qq/Failed to prepare song select statement: $EVAL_ERROR/);
+    }
+    if ($sth->errstr) { 
+        croak(qq/Failed to prepare song select statement: $sth->errstr/);
+    }
     # this doesn't work on Linux / mdbtools for some reason...
-#    $sth->bind_columns( \( @{$song}{ @{ $sth->{NAME} } } ) );    # this allows me to put all the song info into one hashref
-    $sth->bind_columns( \( @{$song}{ qw/Song_Name Artist_Name Album_Name Year Record_Company/  } ) );    # this allows me to put all the song info into one hashref
+    $sth->bind_columns( \( @{$song}{ @{ $sth->{NAME} } } ) );    # this allows me to put all the song info into one hashref
     eval {
         $sth->fetch;
         1;
@@ -236,7 +272,6 @@ sub _build_song_record {
     for my $field (qw/Artist_Name Song_Name Album_Name Record_Company/) {
         $song->{$field} ||= 'N/A';                               # fill in blanks with "N/A"
     }
-    return 1;
 }
 
 # Calculate the approximate duration of an audio track from its size
@@ -484,6 +519,106 @@ sub _is_interval_ok {
     return 1;
 }
 
+sub email_logs {
+    my $logs_dir = shift;
+    
+    my $subject = qq/$CONFIG{'call_letters'} $LAST_QUARTER $YEAR SoundExchange logs/;
+    my $message_text = qq/See attached zip file/;
+
+    my $log_files = [ map { qq{$logs_dir/$_}; } _list_dir($logs_dir) ];
+    my $compressed_logs = compress_logs($log_files);
+
+    my $attachment_filename = qq/$CONFIG{'call_letters'} $LAST_QUARTER $YEAR SoundExchange Logs.zip/;
+    my $logs_attachment = Email::MIME->create(
+        'attributes' => {
+            'filename' => $attachment_filename,
+            'content_type' => q{application/zip},
+            'encoding' => q/base64/,
+        },
+        'body' => io($compressed_logs)->all,
+    );
+    my $text_attachment = Email::MIME->create(
+        'attributes' => {
+            'content_type' => q{text/plain},
+            'disposition' => q/inline/,
+            'charset' => q/US-ASCII/,
+            'encoding' => q/quoted-printable/,
+        },
+        'body_str' => $message_text,
+    );
+    my $parts = [
+        $text_attachment,
+        $logs_attachment,
+    ];
+
+    unlink($compressed_logs);
+    my $email = Email::MIME->create(
+        'header_str' => [ 
+            'From' => $CONFIG{'notify_from'}, 
+            'To' => $CONFIG{'notify_to'},
+            'Subject' => $subject,
+        ],
+        'parts' => $parts,
+    );
+
+    eval {
+        _mail( 
+            { 
+                'from' => $CONFIG{'notify_from'}, 
+                'to' => $CONFIG{'notify_to'}, 
+                'body' => $email->as_string,
+            }
+        );
+        1;
+    } or croak(qq/Failed to send compressed logs: $EVAL_ERROR/);
+    return 1;
+}
+
+sub _mail {
+    my $args = shift;
+    my $mailer = Net::SMTP->new( $CONFIG{'smtp_host'}, Hello => hostname, );
+    if ( !$mailer ) {
+        croak qq/Failed to connect to $CONFIG{'smtp_host'}: $OS_ERROR/;
+    }
+
+    $mailer->mail( $args->{'from'} );
+    $mailer->to( $args->{'to'} );
+    $mailer->data;
+    $mailer->datasend( $args->{'body'} );
+    $mailer->dataend;
+    $mailer->quit;
+    return 1;
+}
+
+sub compress_logs {
+    my $zip = Archive::Zip->new();
+    my $usage = q/Usage: compress_logs(<files_to_compress>, <output_file>)/;
+    my $files_to_compress = shift;
+    if (ref $files_to_compress ne q/ARRAY/) {
+        croak(qq/$usage\nFirst argument must be an arrayref/);
+    }
+
+    for my $file (@{$files_to_compress}) {
+        my $filename = [File::Spec->splitpath($file)]->[2];
+        eval {
+            $zip->addFile($file, $filename);
+            1;
+        } or croak("Failed to add file $file: $EVAL_ERROR");
+    }
+    
+    my ($fh, $output_file) = tempfile();
+    eval {
+        my $status = $zip->writeToFileHandle($fh);
+        1;
+    } or do {
+        $DB::single = 1;
+        croak(qq/Failed to write zip file: $EVAL_ERROR/);
+    };
+    close $fh;
+
+    return $output_file;
+}
+
 sub _list_dir {
     my $dir = shift;
 
@@ -498,28 +633,25 @@ sub _list_dir {
     return @files;
 }
 
-sub _mail {
-    $DB::single = 1;
-    my $args = shift;
-    my $mailer = Net::SMTP->new( $CONFIG{'smtp_host'}, Hello => hostname, );
-    if ( !$mailer ) {
-        croak qq/Failed to connect to $CONFIG{'smtp_host'}: $OS_ERROR/;
+# pull data from a CSV export of the compilations table
+sub _get_compilations_data {
+    open my $fh, '<', $CONFIG{'compilations_data_file'};
+    my $csv = Text::CSV_XS->new(
+        {
+            'sep_char'           => q{,},
+            'binary'             => 1,
+            'allow_loose_quotes' => 1
+        }
+    );
+    my $header = $csv->getline($fh);
+    my $compilations_data = {};
+    
+    my $row = {};
+    $csv->bind_columns( \@{$row}{@{$header}} );
+    while ($csv->getline($fh)) {
+        @{ $compilations_data->{ $row->{'Song_ID'} } }{keys %{$row}} = values %{$row};
     }
-
-    $mailer->mail( $args->{'from'} );
-    $mailer->to( $args->{'to'} );
-    $mailer->data;
-    $mailer->datasend(qq/From: $args->{'from'}\n/);
-    $mailer->datasend(qq/To: $args->{'to'}\n/);
-    if ( $args->{'subject'} ) {
-        $mailer->datasend(qq/Subject: $args->{'subject'}\n/);
-    }
-    $mailer->datasend(qq/\n/);
-    $mailer->datasend( $args->{'message'} );
-    $mailer->datasend(qq/\n/);
-    $mailer->dataend;
-    $mailer->quit;
-    return 1;
+    return $compilations_data;
 }
 
 1;
