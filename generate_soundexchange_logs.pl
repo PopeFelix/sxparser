@@ -33,7 +33,7 @@ use IO::All;
 use Archive::Zip qw/AZ_OK/;
 use File::Temp qw/tempfile/;
 
-our $VERSION = q/2.1/;
+our $VERSION = q/2.2/;
 
 # Global variables section - do not modify these
 Readonly my $YEAR         => localtime->year;
@@ -78,9 +78,6 @@ Readonly my %CONFIG => (
 # Output record separator
     q/output_record_separator/      => qq/\n/,
 
-# Output directory for SX log files.  Will be interpreted relative to current working directory.
-    q/output_dir/                   => File::Spec->catfile(q{..}, q{SX Logs}),
-
 # Number of consecutive days for which we need data
     q/days_needed/                  => 14,
 
@@ -106,7 +103,8 @@ Readonly my %CONFIG => (
     q/notify_from/                  => q|noreply@ktbg.int|,
 
 # "To" address for notification emails
-    q/notify_to/                    => q|bjohnson@ktbg.fm|,
+#    q/notify_to/                    => q|bjohnson@ktbg.fm|,
+    q/notify_to/                    => q|cpeters@ucmo.edu|,
 
 # DSN of database to connect to
     q/dsn/                          => q{ktbg_local},
@@ -117,7 +115,9 @@ Readonly my %CONFIG => (
 main();
 
 sub main {
-    my @parsed_logs = eval { generate_streaming_logs(); } or croak(qq/Failed to generate streaming log: $EVAL_ERROR/);
+    my $log_output_dir = File::Temp::tempdir();
+
+    my @parsed_logs = eval { generate_streaming_logs($log_output_dir); } or croak(qq/Failed to generate streaming log: $EVAL_ERROR/);
     my %log_dates;
 
     # Streaming logs are of the form WMS_YYYYMMDD(_NNN).log, while Simian logs are of the form YYMMDD.lst.
@@ -129,13 +129,13 @@ sub main {
         ( my $date = $filename ) =~ s/^WMS_\d{2}(\d{6}).+/$1/xsm;
         $log_dates{$date} = 1;
     }
-    eval { generate_playlist_logs( sort keys %log_dates ); } or croak(qq/Failed to generate playlist log: $EVAL_ERROR/);
+    eval { 
+        generate_playlist_logs( $log_output_dir, [sort keys %log_dates] ); 
+        1;
+    } or croak(qq/Failed to generate playlist log: $EVAL_ERROR/);
 
-    my $hostname            = hostname();
-    my $output_dir_absolute = abs_path( $CONFIG{'output_dir'} );
-    my $message             = qq/SoundExchange logs for $LAST_QUARTER $YEAR are available on "$hostname" in $output_dir_absolute/;
     eval {
-        email_logs($output_dir_absolute);
+        email_logs($log_output_dir);
     } or croak(qq/Failed to email logs: $EVAL_ERROR/);
 
     return 1;
@@ -144,29 +144,27 @@ sub main {
 # parse the Simian playlist files for the supplied dates (in YYMMDD format), pull the requisite information from the database,
 # and write the Sound_exchange playlist log for that date range.
 sub generate_playlist_logs {
-    my @log_dates = @_;
-    if ( scalar @log_dates == 0 ) {
+    my ($log_output_dir, $log_dates) = @_;
+    if ( scalar @{$log_dates} == 0 ) {
         croak(q/No log dates supplied/);
     }
-    my $output_file = File::Spec->catfile( $CONFIG{'output_dir'}, $CONFIG{'playlist_log_file_name'} );
+    my $output_file = File::Spec->catfile( $log_output_dir, $CONFIG{'playlist_log_file_name'} );
 
-    open my $output_f_h, q/>:encoding(UTF8)/, $output_file;
-    _print_playlist_log( $output_f_h, \@log_dates );
-    close $output_f_h;
+    open my $output_fh, q/>:encoding(UTF8)/, $output_file;
+    _print_playlist_log( $output_fh, $log_dates );
+    close $output_fh;
 
     return 1;    # return a true value so eval() is satisfied
 }
 
 # Parse the WMS streaming logs for the last quarter, write the Sound_exchange log files for each stream, and return a list of the log files parsed.
 sub generate_streaming_logs {
+    my $output_dir = shift;
     if ( !-e $CONFIG{'stream_logs_dir'} ) {
         croak(qq/Stream log directory "$CONFIG{'stream_logs_dir'}" could not be found/);
     }
     if ( !-d $CONFIG{'stream_logs_dir'} ) {
         croak(qq/"$CONFIG{'stream_logs_dir'}" is not a directory/);
-    }
-    if ( !-e $CONFIG{'output_dir'} ) {
-        mkdir $CONFIG{'output_dir'};
     }
     my @streams = _list_dir( $CONFIG{'stream_logs_dir'} );
     my @daily_logs;    # KLUDGE: I need to have some way to get the dates of the log files found.
@@ -174,7 +172,7 @@ sub generate_streaming_logs {
         if ( $stream_name eq '[Global]' ) {    # skip this one; it contains records for all streams
             next;
         }
-        @daily_logs = _print_stream_log($stream_name);
+        @daily_logs = _print_stream_log($output_dir, $stream_name);
     }
     return @daily_logs;
 }
@@ -292,9 +290,9 @@ sub _get_duration {
 }
 
 sub _print_stream_log {
-    my $stream_name   = shift;
+    my ($output_dir, $stream_name) = @_;
     my $stream_subdir = File::Spec->catfile( $CONFIG{'stream_logs_dir'}, $stream_name );
-    my $output_file   = File::Spec->catfile( $CONFIG{'output_dir'}, qq/$CONFIG{'stream_log_file_prefix'} $stream_name.txt/ );
+    my $output_file   = File::Spec->catfile( $output_dir, qq/$CONFIG{'stream_log_file_prefix'} $stream_name.txt/ );
 
     my @daily_logs = _get_last_quarter_wmslogs( $stream_subdir, $CONFIG{'days_needed'} );
     my @parsed;
@@ -526,7 +524,7 @@ sub email_logs {
     my $message_text = qq/See attached zip file/;
 
     my $log_files = [ map { qq{$logs_dir/$_}; } _list_dir($logs_dir) ];
-    my $compressed_logs = compress_logs($log_files);
+    my $compressed_logs = compress_logs($log_files, 1);
 
     my $attachment_filename = qq/$CONFIG{'call_letters'} $LAST_QUARTER $YEAR SoundExchange Logs.zip/;
     my $logs_attachment = Email::MIME->create(
@@ -571,6 +569,7 @@ sub email_logs {
         );
         1;
     } or croak(qq/Failed to send compressed logs: $EVAL_ERROR/);
+
     return 1;
 }
 
@@ -591,9 +590,11 @@ sub _mail {
 }
 
 sub compress_logs {
+    my ($files_to_compress, $delete_after_add) = @_;
+    
     my $zip = Archive::Zip->new();
     my $usage = q/Usage: compress_logs(<files_to_compress>, <output_file>)/;
-    my $files_to_compress = shift;
+    
     if (ref $files_to_compress ne q/ARRAY/) {
         croak(qq/$usage\nFirst argument must be an arrayref/);
     }
@@ -606,15 +607,20 @@ sub compress_logs {
         } or croak("Failed to add file $file: $EVAL_ERROR");
     }
     
-    my ($fh, $output_file) = tempfile();
+    my ($fh, $output_file) = File::Temp::tempfile();
     eval {
         my $status = $zip->writeToFileHandle($fh);
         1;
     } or do {
-        $DB::single = 1;
         croak(qq/Failed to write zip file: $EVAL_ERROR/);
     };
     close $fh;
+        
+    if ($delete_after_add) {
+        for my $file (@{$files_to_compress}) {
+            unlink $file;
+        }
+    }
 
     return $output_file;
 }
