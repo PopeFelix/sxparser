@@ -97,14 +97,13 @@ Readonly my %CONFIG => (
     q/music_dir/                    => q|/mnt/100gig/A3|,
 
 # SMTP host for notification emails
-    q/smtp_host/                    => q|153.91.42.35|,
+    q/smtp_host/                    => q|192.168.1.40|,
 
 # "From" address for notification emails
     q/notify_from/                  => q|noreply@ktbg.int|,
 
 # "To" address for notification emails
-#    q/notify_to/                    => q|bjohnson@ktbg.fm|,
-    q/notify_to/                    => q|cpeters@ucmo.edu|,
+    q/notify_to/                    => q|email@domain.tld|,
 
 # DSN of database to connect to
     q/dsn/                          => q{ktbg_local},
